@@ -6,6 +6,7 @@ use openvm_algebra_transpiler::Rv32ModularArithmeticOpcode;
 use openvm_circuit::arch::{
     instructions::LocalOpcode,
     testing::{VmChipTestBuilder, BITWISE_OP_LOOKUP_BUS},
+    AdapterRuntimeContext, Result, VmAdapterInterface, VmChipWrapper, VmCoreChip,
 };
 use openvm_circuit_primitives::{
     bigint::utils::{big_uint_to_limbs, secp256k1_coord_prime, secp256k1_scalar_prime},
@@ -21,11 +22,14 @@ use openvm_rv32_adapters::{
     rv32_write_heap_default, write_ptr_reg, Rv32IsEqualModAdapterChip, Rv32VecHeapAdapterChip,
 };
 use openvm_rv32im_circuit::adapters::RV32_REGISTER_NUM_LIMBS;
-use openvm_stark_backend::p3_field::FieldAlgebra;
+use openvm_stark_backend::p3_field::{FieldAlgebra, PrimeField32};
 use openvm_stark_sdk::{p3_baby_bear::BabyBear, utils::create_seeded_rng};
 use rand::Rng;
 
-use super::{ModularAddSubChip, ModularIsEqualChip, ModularIsEqualCoreChip, ModularMulDivChip};
+use super::{
+    ModularAddSubChip, ModularIsEqualChip, ModularIsEqualCoreAir, ModularIsEqualCoreChip,
+    ModularIsEqualCoreRecord, ModularMulDivChip,
+};
 
 const NUM_LIMBS: usize = 32;
 const LIMB_BITS: usize = 8;
@@ -374,4 +378,136 @@ fn test_modular_is_equal_1x32() {
 #[test]
 fn test_modular_is_equal_3x16() {
     test_is_equal::<3, 16, 48>(17, BLS12_381_MODULUS.clone(), 100);
+}
+
+// Wrapper chip for testing a bad setup row
+type BadModularIsEqualChip<
+    F,
+    const NUM_LANES: usize,
+    const LANE_SIZE: usize,
+    const TOTAL_LIMBS: usize,
+> = VmChipWrapper<
+    F,
+    Rv32IsEqualModAdapterChip<F, 2, NUM_LANES, LANE_SIZE, TOTAL_LIMBS>,
+    BadModularIsEqualCoreChip<TOTAL_LIMBS, RV32_REGISTER_NUM_LIMBS, RV32_CELL_BITS>,
+>;
+
+// Wrapper chip for testing a bad setup row
+struct BadModularIsEqualCoreChip<
+    const READ_LIMBS: usize,
+    const WRITE_LIMBS: usize,
+    const LIMB_BITS: usize,
+> {
+    chip: ModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS>,
+}
+
+impl<const READ_LIMBS: usize, const WRITE_LIMBS: usize, const LIMB_BITS: usize>
+    BadModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS>
+{
+    pub fn new(
+        modulus: BigUint,
+        bitwise_lookup_chip: SharedBitwiseOperationLookupChip<LIMB_BITS>,
+        offset: usize,
+    ) -> Self {
+        Self {
+            chip: ModularIsEqualCoreChip::new(modulus, bitwise_lookup_chip, offset),
+        }
+    }
+}
+
+impl<
+        F: PrimeField32,
+        I: VmAdapterInterface<F>,
+        const READ_LIMBS: usize,
+        const WRITE_LIMBS: usize,
+        const LIMB_BITS: usize,
+    > VmCoreChip<F, I> for BadModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS>
+where
+    I::Reads: Into<[[F; READ_LIMBS]; 2]>,
+    I::Writes: From<[[F; WRITE_LIMBS]; 1]>,
+{
+    type Record = ModularIsEqualCoreRecord<F, READ_LIMBS>;
+    type Air = ModularIsEqualCoreAir<READ_LIMBS, WRITE_LIMBS, LIMB_BITS>;
+
+    #[allow(clippy::type_complexity)]
+    fn execute_instruction(
+        &self,
+        instruction: &Instruction<F>,
+        from_pc: u32,
+        reads: I::Reads,
+    ) -> Result<(AdapterRuntimeContext<F, I>, Self::Record)> {
+        // Override the b_diff_idx to be out of bounds.
+        // This will cause lt_marker to be all zeros except a 2.
+        // There was a bug in this case which allowed b to be less than N.
+        self.chip
+            .execute_instruction(instruction, from_pc, reads)
+            .map(|(context, mut record)| {
+                record.b_diff_idx = READ_LIMBS;
+                (context, record)
+            })
+    }
+
+    fn get_opcode_name(&self, opcode: usize) -> String {
+        <ModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS> as VmCoreChip<F, I>>::get_opcode_name(&self.chip, opcode)
+    }
+
+    fn generate_trace_row(&self, row_slice: &mut [F], record: Self::Record) {
+        <ModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS> as VmCoreChip<F, I>>::generate_trace_row(&self.chip, row_slice, record)
+    }
+
+    fn air(&self) -> &Self::Air {
+        <ModularIsEqualCoreChip<READ_LIMBS, WRITE_LIMBS, LIMB_BITS> as VmCoreChip<F, I>>::air(
+            &self.chip,
+        )
+    }
+}
+
+// Test that passes the wrong modulus in the setup instruction.
+// This proof should fail to verify.
+fn test_is_equal_setup_bad<
+    const NUM_LANES: usize,
+    const LANE_SIZE: usize,
+    const TOTAL_LIMBS: usize,
+>(
+    opcode_offset: usize,
+    modulus: BigUint,
+) {
+    let bitwise_bus = BitwiseOperationLookupBus::new(BITWISE_OP_LOOKUP_BUS);
+    let bitwise_chip = SharedBitwiseOperationLookupChip::<LIMB_BITS>::new(bitwise_bus);
+
+    let mut tester: VmChipTestBuilder<F> = VmChipTestBuilder::default();
+    let mut chip = BadModularIsEqualChip::<F, NUM_LANES, LANE_SIZE, TOTAL_LIMBS>::new(
+        Rv32IsEqualModAdapterChip::new(
+            tester.execution_bus(),
+            tester.program_bus(),
+            tester.memory_bridge(),
+            tester.address_bits(),
+            bitwise_chip.clone(),
+        ),
+        BadModularIsEqualCoreChip::new(modulus.clone(), bitwise_chip.clone(), opcode_offset),
+        tester.offline_memory_mutex_arc(),
+    );
+
+    let setup_instruction = rv32_write_heap_default::<TOTAL_LIMBS>(
+        &mut tester,
+        vec![[F::ZERO; TOTAL_LIMBS]],
+        vec![[F::ZERO; TOTAL_LIMBS]],
+        opcode_offset + Rv32ModularArithmeticOpcode::SETUP_ISEQ as usize,
+    );
+    tester.execute(&mut chip, &setup_instruction);
+
+    let tester = tester.build().load(chip).load(bitwise_chip).finalize();
+    tester.simple_test().expect("Verification failed");
+}
+
+#[should_panic]
+#[test]
+fn test_modular_is_equal_setup_bad_1x32() {
+    test_is_equal_setup_bad::<1, 32, 32>(17, secp256k1_coord_prime());
+}
+
+#[should_panic]
+#[test]
+fn test_modular_is_equal_setup_bad_3x16() {
+    test_is_equal_setup_bad::<3, 16, 48>(17, BLS12_381_MODULUS.clone());
 }
