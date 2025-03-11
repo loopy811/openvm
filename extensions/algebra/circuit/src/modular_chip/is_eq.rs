@@ -184,7 +184,7 @@ where
             // being 1 indicates b[i] < N[i].
             builder
                 .when_ne(prefix_sum.clone(), AB::F::ONE)
-                .when_ne(prefix_sum.clone(), lt_marker_sum.clone())
+                .when_ne(prefix_sum.clone(), lt_marker_sum.clone() - cols.is_setup)
                 .assert_eq(cols.b[i], modulus[i]);
             builder
                 .when_ne(cols.lt_marker[i], AB::F::ZERO)
